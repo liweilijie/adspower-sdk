@@ -2,6 +2,7 @@ import json
 import time
 import uuid
 import os
+import sys
 import threading
 import logging
 from typing import Optional, Generator
@@ -9,7 +10,16 @@ from redis import Redis
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from adspowerapi import AdsPowerAPI  # 假设你已有 AdsPowerAPI 类
+
+# 获取当前文件的目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 将当前目录添加到 sys.path
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+from adspowerapi import AdsPowerAPI
+
 
 logger = logging.getLogger(__name__)
 
