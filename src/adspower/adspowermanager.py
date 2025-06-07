@@ -39,6 +39,40 @@ def decode_bytes(obj):
         return obj
 
 
+"""
+ProfilePool 类分析:
+
+1. 单例模式的必要性:
+   - ProfilePool 管理着全局的 profile 资源池,需要保证所有实例共享同一个资源池
+   - 避免多个实例导致的资源竞争和数据不一致
+   - 确保计数器(count_key)的准确性
+   - 保证清理任务不会重复执行
+
+2. 核心职责:
+   - 管理 profile 生命周期(创建、分配、释放、删除)
+   - 维护 profile 使用状态
+   - 处理进程心跳检测
+   - 执行资源清理(被封 profile、死进程资源等)
+   - 控制资源池大小
+
+3. 关键设计:
+   - 使用 Redis 存储所有状态,支持分布式部署
+   - 通过心跳机制检测进程存活
+   - 实现租约机制管理 profile 分配
+   - 支持 profile 复用和动态扩缩容
+   - 自动清理无效资源
+
+4. 线程安全:
+   - 使用 threading.Lock 保护单例创建
+   - Redis 操作原子性保证并发安全
+   - 状态更新通过事务保证一致性
+
+5. 可靠性保证:
+   - 异常处理和日志记录
+   - 超时控制和重试机制
+   - 资源泄露防护
+"""
+
 class ProfilePool:
     _instance = None
     _lock = threading.Lock()
