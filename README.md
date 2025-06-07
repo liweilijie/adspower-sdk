@@ -59,4 +59,4 @@ Feel free to customize this template further to suit the specific details and re
 
 是一个基于多进程的，在每个进程中是单例模式而已。
 
-![profile](./doc/profile.svg)
+![profile](doc/profile.svg)
