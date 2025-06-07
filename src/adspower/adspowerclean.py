@@ -5,6 +5,7 @@ import asyncio
 from redis import Redis
 from adspower.adspowerapi import AdsPowerAPI
 from adspower.adspowermanager import ProfilePool
+from adspower.utils import get_redis_client
 
 # 配置日志
 logging.basicConfig(
@@ -19,7 +20,7 @@ class AdsPowerCleanerService:
     AdsPower资源清理服务
     定期调用ProfilePool的cleanup_resources方法清理无效资源
     """
-    def __init__(self, check_interval: int = 60):  # 默认1分钟检查一次
+    def __init__(self, redis_client: Redis, check_interval: int = 60):  # 默认1分钟检查一次
         """
         初始化清理服务
         
@@ -27,7 +28,7 @@ class AdsPowerCleanerService:
             check_interval: 检查间隔(秒)，默认60秒
         """
         self.api = AdsPowerAPI()
-        self.redis = Redis(host='localhost', port=6379, db=2)
+        self.redis = redis_client
         self.pool = ProfilePool(self.api, self.redis)
         self.check_interval = check_interval
         self.running = True
@@ -69,7 +70,8 @@ class AdsPowerCleanerService:
 async def main():
     """主函数"""
     try:
-        cleaner = AdsPowerCleanerService()
+        redis_client = get_redis_client()
+        cleaner = AdsPowerCleanerService(redis_client=redis_client)
         await cleaner.run()
     except Exception as e:
         logger.error(f"服务运行出错: {e}")

@@ -1,0 +1,10 @@
+# files will be auto encrypted when commit
+link/.gauth filter=git-crypt diff=git-crypt
+link/.ssh/** filter=git-crypt diff=git-crypt
+src/adspower/settings.py filter=git-crypt diff=git-crypt
+
+
+# avoid accidentally encrypt files
+# NOTES: need to be at last to have highest priority
+.gitignore !filter !diff
+.gitattributes !filter !diff

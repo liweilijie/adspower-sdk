@@ -1,0 +1,62 @@
+import time
+import logging
+import redis
+from redis.exceptions import ConnectionError, TimeoutError
+from . import settings
+
+# 配置日志
+logger = logging.getLogger(__name__)
+
+# 创建全局连接池
+try:
+    pool = redis.BlockingConnectionPool(
+        host=settings.REDIS_HOST,
+        port=settings.REDIS_PORT,
+        db=settings.REDIS_DB,
+        password=settings.REDIS_PASSWORD,
+        max_connections=settings.REDIS_CONNECTIONS,
+        # 关于 decode_responses 参数：如果您希望 Redis 返回的结果是字符串类型而不是字节串，可以将其设置为 True。这在处理字符串数据时非常方便，但如果您需要处理二进制数据（如使用 pickle 序列化的对象），建议保持为 False，以避免解码错误。
+        decode_responses=settings.REDIS_DECODE_RESPONSES,
+        health_check_interval=settings.REDIS_HEALTH_CHECK_INTERVAL,
+        timeout=30,  # 等待连接可用的最大时间（秒）
+    )
+except Exception as e:
+    logger.error(f"Redis连接池初始化失败: {e}")
+    pool = None
+
+def get_redis_client(max_retries: int = 3, retry_interval: int = 5):
+    """
+    获取Redis客户端实例，使用全局连接池
+    
+    参数:
+        max_retries: 最大重试次数，默认3次
+        retry_interval: 重试间隔（秒），默认5秒
+    
+    返回:
+        redis.StrictRedis: Redis客户端实例
+        
+    异常:
+        redis.ConnectionError: 如果在最大重试次数内都无法连接则抛出此异常
+    """
+    if pool is None:
+        raise RuntimeError("Redis连接池未初始化")
+        
+    retries = 0
+    while retries < max_retries:
+        try:
+            client = redis.StrictRedis(connection_pool=pool)
+            client.ping()  # 测试连接
+            return client
+            
+        except (ConnectionError, TimeoutError) as e:
+            retries += 1
+            if retries >= max_retries:
+                logger.error(f"Redis连接失败，已达到最大重试次数({max_retries}次)")
+                raise
+                
+            logger.warning(f"Redis连接失败({retries}/{max_retries})，{retry_interval}秒后重试...")
+            time.sleep(retry_interval)
+            
+        except Exception as e:
+            logger.error(f"Redis连接发生未知错误: {str(e)}")
+            raise
