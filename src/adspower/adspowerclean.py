@@ -1,18 +1,24 @@
+import os
+import sys
 import signal
 import time
 import logging
-import asyncio
 from redis import Redis
-from adspower.adspowerapi import AdsPowerAPI
-from adspower.adspowermanager import ProfilePool
+
+# 获取当前文件的目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+
+# 将父目录添加到 sys.path
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 from adspower.utils import get_redis_client
+from adspower.adspowermanager import ProfilePool
+from adspower.adspowerapi import AdsPowerAPI
+from adspower.settings import SERVICE_CHECK_INTERVAL
 
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
 logger = logging.getLogger(__name__)
 
 class AdsPowerCleanerService:
@@ -20,12 +26,13 @@ class AdsPowerCleanerService:
     AdsPower资源清理服务
     定期调用ProfilePool的cleanup_resources方法清理无效资源
     """
-    def __init__(self, redis_client: Redis, check_interval: int = 60):  # 默认1分钟检查一次
+    def __init__(self, redis_client: Redis, check_interval: int = SERVICE_CHECK_INTERVAL):
         """
         初始化清理服务
         
         参数:
-            check_interval: 检查间隔(秒)，默认60秒
+            redis_client: Redis客户端实例
+            check_interval: 检查间隔(秒)，默认从settings获取
         """
         self.api = AdsPowerAPI()
         self.redis = redis_client
@@ -42,7 +49,7 @@ class AdsPowerCleanerService:
         logger.info("接收到终止信号，准备关闭清理服务...")
         self.running = False
 
-    async def cleanup_once(self) -> None:
+    def cleanup_once(self) -> None:
         """执行一次资源清理"""
         try:
             # 检查Redis连接
@@ -51,35 +58,42 @@ class AdsPowerCleanerService:
                 return
                 
             # 执行清理
-            await self.pool.cleanup_resources()
+            self.pool.cleanup_resources()
             logger.info("清理任务完成")
             
         except Exception as e:
             logger.error(f"清理任务执行出错: {e}")
 
-    async def run(self):
+    def run(self):
         """运行清理服务"""
         logger.info("AdsPower清理服务启动")
         
         while self.running:
-            await self.cleanup_once()
-            await asyncio.sleep(self.check_interval)
+            self.cleanup_once()
+            time.sleep(self.check_interval)
 
         logger.info("AdsPower清理服务已停止")
 
-async def main():
+def main():
     """主函数"""
     try:
         redis_client = get_redis_client()
         cleaner = AdsPowerCleanerService(redis_client=redis_client)
-        await cleaner.run()
+        cleaner.run()
     except Exception as e:
         logger.error(f"服务运行出错: {e}")
         raise
 
 if __name__ == "__main__":
+    # 配置日志格式
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("程序被用户中断")
     except Exception as e:

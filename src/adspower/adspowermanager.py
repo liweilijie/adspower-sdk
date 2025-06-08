@@ -10,10 +10,9 @@ from redis import Redis
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from twisted.internet import defer, reactor
-from twisted.internet.defer import inlineCallbacks, returnValue
 from selenium.common.exceptions import TimeoutException, WebDriverException
 import signal
+import redis
 
 # 获取当前文件的目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -125,60 +124,164 @@ class ProfilePool:
         count = self.redis.get(self.count_key)
         return int(count) if count else 0
 
+    def get_all_profiles(self) -> List[Dict]:
+        """
+        获取所有profile信息
+        
+        Returns:
+            List[Dict]: profile列表，每个profile包含完整的信息
+        """
+        try:
+            # 获取所有profile数据
+            all_profiles = self.redis.hgetall(self.pool_key)
+            
+            # 解码并转换为字典列表
+            profiles = []
+            for user_id, profile_data in all_profiles.items():
+                try:
+                    # 确保user_id是字符串
+                    user_id = decode_bytes(user_id)
+                    # 解析profile数据
+                    profile = json.loads(decode_bytes(profile_data))
+                    # 确保user_id存在于profile中
+                    profile["user_id"] = user_id
+                    profiles.append(profile)
+                except json.JSONDecodeError as e:
+                    logger.error(f"解析profile数据失败 {user_id}: {e}")
+                except Exception as e:
+                    logger.error(f"处理profile {user_id} 时出错: {e}")
+                    
+            return profiles
+            
+        except Exception as e:
+            logger.error(f"获取profile列表失败: {e}")
+            return []
+
+    def _sync_with_adspower(self) -> None:
+        """
+        同步 Redis 中的数据与 AdsPower 实际数据
+        在 Redis 数据丢失或不一致时调用
+        """
+        try:
+            # 获取 AdsPower 中的所有 profile
+            actual_profiles = self.api.get_browser_list()
+            actual_profile_ids = {p["user_id"] for p in actual_profiles}
+            
+            # 获取 Redis 中的所有 profile
+            redis_profiles = self.get_all_profiles()
+            redis_profile_ids = {p["user_id"] for p in redis_profiles}
+            
+            # 检查是否需要同步
+            if not redis_profiles or actual_profile_ids != redis_profile_ids:
+                logger.warning("检测到 Redis 数据与实际不一致，开始同步...")
+                
+                # 获取当前活跃的浏览器
+                opened_profiles = self.api.get_opened_user_ids()
+                
+                # 重建 Redis 数据
+                now = int(time.time())
+                for profile in actual_profiles:
+                    user_id = profile["user_id"]
+                    profile_data = {
+                        "user_id": user_id,
+                        "created_at": now,
+                        "last_used": now,
+                        "in_use": user_id in opened_profiles,
+                        "is_blocked": False,
+                        "blocked_count": 0,
+                        "lease_id": None,
+                        "spider_name": None,
+                        "browser_opened": user_id in opened_profiles,
+                        "group_id": profile.get("group_id")
+                    }
+                    self.redis.hset(self.pool_key, user_id, json.dumps(profile_data))
+                
+                # 更新计数
+                self.redis.set(self.count_key, len(actual_profiles))
+                logger.info(f"数据同步完成，共同步了 {len(actual_profiles)} 个 profile")
+                
+        except Exception as e:
+            logger.error(f"同步数据失败: {e}")
+
     def cleanup_resources(self):
         """
         清理资源的核心逻辑
         现在由 AdsPowerCleanerService 调用，而不是在内部线程中运行
         """
-        now = int(time.time())
-        all_profiles = self.get_all_profiles()
-        active_processes = self._get_active_processes()
-        
-        for profile in all_profiles:
-            user_id = profile.get("user_id")
-            if not user_id:
-                continue
-                
-            try:
-                # 检查是否需要清理已死亡进程的profile
-                if profile.get("in_use"):
-                    process_id = profile.get("lease_id", "").split("_")[0]
-                    if process_id and process_id not in active_processes:
-                        logger.warning(f"检测到死亡进程 {process_id} 的profile: {user_id}，准备清理")
-                        self._cleanup_profile(user_id, profile, now)
-                        continue
-                
-                # 检查是否需要删除被封的profile
-                if profile.get("is_blocked") and profile.get("blocked_count", 0) >= 3:
-                    logger.info(f"删除被封的profile: {user_id}")
-                    self._delete_profile(user_id)
+        try:
+            # 首先检查并同步数据
+            self._sync_with_adspower()
+            
+            now = int(time.time())
+            all_profiles = self.get_all_profiles()
+            active_processes = self._get_active_processes()
+            
+            logger.info(f"当前活跃进程: {active_processes}")
+            logger.info(f"所有profiles状态: {json.dumps(all_profiles, indent=2)}")
+            
+            for profile in all_profiles:
+                user_id = profile.get("user_id")
+                if not user_id:
                     continue
-                
-                # 检查是否需要关闭空闲浏览器
-                if (not profile.get("in_use") and 
-                    profile.get("browser_opened", False) and
-                    now - profile.get("last_used", 0) > self.idle_timeout):
-                    logger.info(f"关闭空闲浏览器: {user_id}")
-                    self._close_browser(user_id, profile)
+                    
+                try:
+                    # 检查是否需要清理已死亡进程的profile
+                    if profile.get("in_use") or profile.get("browser_opened"):
+                        lease_id = profile.get("lease_id", "")
+                        process_id = lease_id.split("_")[0] if lease_id else None
                         
-            except Exception as e:
-                logger.error(f"处理profile {user_id} 时出错: {e}")
+                        if process_id and process_id not in active_processes:
+                            logger.warning(f"检测到死亡进程 {process_id} 的profile: {user_id}，准备清理")
+                            self._cleanup_profile(user_id, profile, now)
+                            continue
+                        elif not process_id and profile.get("browser_opened"):
+                            logger.warning(f"检测到无进程信息但浏览器打开的profile: {user_id}，准备清理")
+                            self._cleanup_profile(user_id, profile, now)
+                            continue
+                    
+                    # 检查是否需要删除被封的profile
+                    if profile.get("is_blocked") and profile.get("blocked_count", 0) >= 3:
+                        logger.info(f"删除被封的profile: {user_id}")
+                        self._delete_profile(user_id)
+                        continue
+                    
+                    # 检查是否需要关闭空闲浏览器
+                    if (not profile.get("in_use") and 
+                        profile.get("browser_opened", False) and
+                        now - profile.get("last_used", 0) > self.idle_timeout):
+                        logger.info(f"关闭空闲浏览器: {user_id}")
+                        self._close_browser(user_id, profile)
+                            
+                except Exception as e:
+                    logger.error(f"处理profile {user_id} 时出错: {e}")
+                    
+        except Exception as e:
+            logger.error(f"清理资源时发生错误: {e}")
+            # 如果是 Redis 连接错误，可以选择重试或者报警
+            if isinstance(e, (redis.ConnectionError, redis.TimeoutError)):
+                logger.critical("Redis 连接失败，请检查 Redis 服务状态")
 
     def _cleanup_profile(self, user_id: str, profile: dict, now: int):
         """清理单个profile的资源"""
         try:
-            self.api.close_browser(user_id)
+            # 先检查浏览器是否真的在运行
+            is_active = self.api.is_browser_active(user_id)
+            if is_active:
+                logger.info(f"关闭浏览器 {user_id}")
+                self.api.close_browser(user_id)
+            
+            # 更新状态
+            profile.update({
+                "in_use": False,
+                "last_used": now,
+                "lease_id": None,
+                "spider_name": None,
+                "browser_opened": False
+            })
+            self.redis.hset(self.pool_key, user_id, json.dumps(profile))
+            logger.info(f"已清理profile {user_id} 的状态")
         except Exception as e:
-            logger.warning(f"关闭浏览器失败: {e}")
-        
-        profile.update({
-            "in_use": False,
-            "last_used": now,
-            "lease_id": None,
-            "spider_name": None,
-            "browser_opened": False
-        })
-        self.redis.hset(self.pool_key, user_id, json.dumps(profile))
+            logger.error(f"清理profile {user_id} 失败: {e}")
 
     def _delete_profile(self, user_id: str):
         """删除被封的profile"""
@@ -205,6 +308,8 @@ class ProfilePool:
         
         # 获取所有进程心跳
         all_heartbeats = self.redis.hgetall(self.heartbeat_key)
+        logger.info(f"所有进程心跳: {all_heartbeats}")
+        
         for pid, last_heartbeat in all_heartbeats.items():
             pid = decode_bytes(pid)
             last_heartbeat = int(decode_bytes(last_heartbeat))
@@ -212,8 +317,10 @@ class ProfilePool:
             # 检查心跳是否超时
             if now - last_heartbeat <= self.heartbeat_timeout:
                 active_processes.add(pid)
+                logger.debug(f"进程 {pid} 活跃中，最后心跳: {last_heartbeat}")
             else:
                 # 清理超时的心跳记录
+                logger.warning(f"进程 {pid} 心跳超时，最后心跳: {last_heartbeat}")
                 self.redis.hdel(self.heartbeat_key, pid)
                 
         return active_processes
@@ -222,7 +329,7 @@ class ProfilePool:
         """更新进程心跳"""
         self.redis.hset(self.heartbeat_key, process_id, int(time.time()))
 
-    def get_available_profile(self, spider_name: str) -> Optional[str]:
+    def get_available_profile(self, spider_name: str, group_id: Optional[str] = None) -> Optional[str]:
         """
         获取一个可用的profile
         
@@ -233,6 +340,7 @@ class ProfilePool:
         
         Args:
             spider_name: 爬虫名称，用于跟踪哪个爬虫在使用profile
+            group_id: 组ID，用于区分不同的爬虫组
             
         Returns:
             Optional[str]: profile ID，如果没有可用的则返回None
@@ -249,7 +357,8 @@ class ProfilePool:
                     "in_use": True,
                     "last_used": now,
                     "lease_id": f"{os.getpid()}_{uuid.uuid4().hex[:6]}",
-                    "spider_name": spider_name
+                    "spider_name": spider_name,
+                    "group_id": group_id
                 })
                 self.redis.hset(self.pool_key, user_id, json.dumps(profile))
                 return user_id
@@ -258,7 +367,6 @@ class ProfilePool:
         current_count = self._get_pool_count()
         if current_count < self.max_pool_size:
             try:
-                group_id = self.api.get_or_create_random_group()
                 result = self.api.create_browser(group_id)
                 user_id = result.get("data", {}).get("id")
                 if user_id:
@@ -271,7 +379,8 @@ class ProfilePool:
                         "blocked_count": 0,
                         "lease_id": f"{os.getpid()}_{uuid.uuid4().hex[:6]}",
                         "spider_name": spider_name,
-                        "browser_opened": False
+                        "browser_opened": False,
+                        "group_id": group_id
                     }
                     self.redis.hset(self.pool_key, user_id, json.dumps(profile_data))
                     self._increment_pool_count()
@@ -354,12 +463,10 @@ class AdspowerProfileLeaseManager:
     def __init__(self, api: 'AdsPowerAPI', redis: Redis, 
                  spider_name: str,
                  pool: Optional[ProfilePool] = None,
-                 lease_ttl: int = 1800,
-                 heartbeat_interval: int = 30):  # 心跳更新间隔（秒）
+                 heartbeat_interval: int = 30):
         self.api = api
         self.redis = redis
         self.spider_name = spider_name
-        self.lease_ttl = lease_ttl
         self.pool = pool or ProfilePool(api, redis)
         self.user_id: Optional[str] = None
         self._renew_thread: Optional[threading.Thread] = None
@@ -367,28 +474,25 @@ class AdspowerProfileLeaseManager:
         self._stop_event = threading.Event()
         self.heartbeat_interval = heartbeat_interval
         self.process_id = str(os.getpid())
+        self.lease_id = None  # 添加lease_id属性
+        self.profile_key = "adspower:profile_pool"  # 添加profile_key属性
+        logger.info(f"✅ process_id: {self.process_id}, spider_name: {self.spider_name}")
 
-    def create_profile(self) -> str:
-        """
-        创建或获取一个profile
-        
-        策略：
-        1. 从池中获取可用的profile
-        2. 如果没有可用的，等待一段时间后重试
-        3. 最多重试3次
-        """
+    def create_profile(self, group_id: Optional[str] = None) -> str:
+        """创建或获取一个profile"""
         retry_count = 0
         while retry_count < 3:
-            user_id = self.pool.get_available_profile(self.spider_name)
+            user_id = self.pool.get_available_profile(self.spider_name, group_id)
             if user_id:
                 self.user_id = user_id
+                self.lease_id = f"{self.process_id}_{uuid.uuid4().hex[:6]}"  # 设置lease_id
                 logger.info(f"[ProfileLease] Spider {self.spider_name} 获取到 profile: {self.user_id}")
                 return self.user_id
             
             retry_count += 1
             if retry_count < 3:
                 logger.info(f"等待可用profile... (重试 {retry_count}/3)")
-                time.sleep(10)  # 等待10秒后重试
+                time.sleep(10)
         
         raise RuntimeError("无法获取可用的profile，请检查pool容量设置或等待profile释放")
 
@@ -428,9 +532,9 @@ class AdspowerProfileLeaseManager:
             self.pool.mark_profile_blocked(self.user_id)
             logger.info(f"[ProfileLease] Spider {self.spider_name} 标记 profile {self.user_id} 为被封状态")
 
-    def start(self):
+    def start(self, group_id: Optional[str] = None):
         """启动profile管理"""
-        self.create_profile()
+        self.create_profile(group_id)
         self._start_renew_thread()
         self._start_heartbeat_thread()
 
@@ -471,24 +575,27 @@ class AdspowerProfileLeaseManager:
         return self.user_id
 
     def update_lease(self):
-        if self.user_id:
+        """更新租约信息"""
+        if not self.user_id or not self.lease_id:
+            return
+            
+        try:
             lease = self.redis.hget(self.profile_key, self.user_id)
             if lease:
-                lease_data = json.loads(lease)
-                if lease_data["lease_id"] == self.lease_id:
-                    lease_data["last_active"] = int(time.time())
-                    lease_data["closed_count"] = 0
-                    lease_data= decode_bytes(lease_data)
+                lease_data = json.loads(decode_bytes(lease))
+                if lease_data.get("lease_id") == self.lease_id:
+                    lease_data.update({
+                        "last_active": int(time.time()),
+                        "closed_count": 0
+                    })
                     self.redis.hset(self.profile_key, self.user_id, json.dumps(lease_data))
-                    logger.info(f'[LeaseUpdate] user_id={self.user_id} lease info updated: {json.dumps(lease_data)}')
+                    logger.info(f'[LeaseUpdate] user_id={self.user_id} lease info updated')
+        except Exception as e:
+            logger.error(f"更新租约失败: {e}")
 
-    @inlineCallbacks
-    def check_network_status(self, driver: webdriver.Chrome, target_url: str):
+    def check_network_status(self, driver: webdriver.Chrome, target_url: str) -> bool:
         """
-        使用Twisted异步机制检查网络状态和反爬状态
-        
-        该方法使用@inlineCallbacks装饰器,允许我们在同步的Selenium操作中使用异步方式处理结果。
-        虽然Selenium操作本身是同步的,但我们可以使用这种方式将它们集成到Twisted的异步流程中。
+        同步方式检查网络状态和反爬状态
         
         检测网络状态的主要方式:
         1. 设置页面加载超时时间,检测是否能正常访问目标URL
@@ -500,8 +607,7 @@ class AdspowerProfileLeaseManager:
             target_url: 要访问的目标URL
             
         Returns:
-            Deferred[bool]: 返回一个最终解析为布尔值的Deferred对象
-                           True表示网络正常,False表示被封禁或异常
+            bool: True表示网络正常,False表示被封禁或异常
         """
         try:
             # 设置页面加载超时时间
@@ -513,7 +619,7 @@ class AdspowerProfileLeaseManager:
                 driver.get(target_url)
             except Exception as e:
                 logger.warning(f"页面加载超时或失败: {e}")
-                returnValue(False)
+                return False
             
             # 检查页面状态
             try:
@@ -545,15 +651,15 @@ class AdspowerProfileLeaseManager:
                 
                 if network_status.get('hasNetworkError'):
                     logger.warning("检测到网络错误")
-                    returnValue(False)
+                    return False
                     
                 if network_status.get('redirectCount', 0) > 2:
                     logger.warning("检测到异常重定向")
-                    returnValue(False)
+                    return False
                     
             except Exception as e:
                 logger.warning(f"JavaScript执行检查失败: {e}")
-                returnValue(False)
+                return False
             
             # 快速检查页面内容
             try:
@@ -567,50 +673,51 @@ class AdspowerProfileLeaseManager:
                     'too many requests'
                 ]):
                     logger.warning("检测到访问被拒绝")
-                    returnValue(False)
+                    return False
             except Exception as e:
                 logger.warning(f"检查页面内容失败: {e}")
-                returnValue(False)
+                return False
                 
-            returnValue(True)
+            return True
             
         except Exception as e:
             logger.error(f"网络状态检查失败: {e}")
-            returnValue(False)
-    @inlineCallbacks
-    def is_profile_blocked(self, target_url: str):
+            return False
+
+    def is_profile_blocked(self, target_url: str) -> bool:
         """
-        Asynchronously check if current profile is blocked
+        同步方式检查当前profile是否被封禁
         
-        This method combines API level check and actual webpage access check,
-        using yield to wait for asynchronous operations to complete.
+        这个方法结合了API级别的检查和实际的网页访问检查
         
         Args:
-            target_url: Target URL to access
+            target_url: 目标URL
             
         Returns:
-            Deferred[bool]: Returns a Deferred object that eventually resolves to a boolean
-                           True means blocked, False means normal
+            bool: True表示被封禁，False表示正常
         """
         if not self.user_id:
-            returnValue(False)
+            return False
             
-        # First check API level
-        blocked = yield self.api.is_profile_blocked(self.user_id, target_url)
-        if blocked:
-            returnValue(True)
+        # 首先检查API级别
+        try:
+            blocked = self.api.is_profile_blocked(self.user_id, target_url)
+            if blocked:
+                return True
+        except Exception as e:
+            logger.error(f"API检查失败: {e}")
+            return True  # 如果API检查失败，为安全起见认为被封
             
-        # If API check passes, then check actual access
+        # 如果API检查通过，则检查实际访问
         try:
             driver = self.start_driver()
             try:
-                status = yield self.check_network_status(driver, target_url)
-                returnValue(not status)
+                return not self.check_network_status(driver, target_url)
             finally:
                 driver.quit()
         except Exception as e:
-            logger.error(f"Failed to check profile status: {e}")
-            returnValue(True)  # If there's an exception, play it safe and assume blocked
+            logger.error(f"检查profile状态失败: {e}")
+            return True  # 如果有异常，为安全起见认为被封
 
     def _start_heartbeat_thread(self):
         """启动心跳更新线程"""
@@ -629,111 +736,6 @@ class AdspowerProfileLeaseManager:
         if self._heartbeat_thread:
             self._stop_event.set()
             self._heartbeat_thread.join()
-
-def test_multi_spider_scenario():
-    """
-    测试多Spider场景下的profile共享
-    """
-    from redis import Redis
-    from adspowerapi import AdsPowerAPI
-    
-    api = AdsPowerAPI()
-    redis_client = Redis(host="localhost", port=6379, db=0)
-    
-    # 创建共享的ProfilePool
-    pool = ProfilePool(api, redis_client, max_pool_size=15)  # 设置最大15个profile
-    
-    # 模拟多个Spider
-    spider_names = ["spider1", "spider2", "spider3"]
-    managers = []
-    
-    @inlineCallbacks
-    def run_test():
-        try:
-            # 创建多个LeaseManager
-            for spider_name in spider_names:
-                manager = AdspowerProfileLeaseManager(
-                    api, 
-                    redis_client,
-                    spider_name=spider_name,
-                    pool=pool
-                )
-                managers.append(manager)
-                
-            # 测试并发获取profile
-            for manager in managers:
-                manager.start()
-                logger.info(f"Spider {manager.spider_name} 获取到 profile: {manager.user_id}")
-                
-            # 等待一段时间
-            time.sleep(30)
-                
-            # 测试profile状态
-            for manager in managers:
-                if manager.user_id:
-                    result = yield manager.is_profile_blocked("https://www.google.com")
-                    logger.info(f"Spider {manager.spider_name} profile状态: {'已封禁' if result else '正常'}")
-            
-            # 模拟一个profile被封
-            if managers[0].user_id:
-                managers[0].mark_current_profile_blocked()
-                logger.info(f"模拟 Spider {managers[0].spider_name} 的profile被封")
-            
-            # 清理
-            for manager in managers:
-                manager.stop()
-                
-        except Exception as e:
-            logger.error(f"测试过程中出错: {e}")
-        finally:
-            reactor.stop()
-    
-    # 启动测试
-    reactor.callWhenRunning(run_test)
-    reactor.run()
-
-class AdsPowerCleanerService:
-    """
-    独立的AdsPower资源清理服务
-    作为单独的进程运行，负责清理所有无效的资源
-    """
-    def __init__(self, check_interval: int = 60):
-        self.api = AdsPowerAPI()
-        self.redis = Redis(host='localhost', port=6379, db=0)
-        self.pool = ProfilePool(self.api, self.redis)
-        self.check_interval = check_interval
-        self.running = True
-        
-        # 注册信号处理
-        signal.signal(signal.SIGTERM, self.handle_shutdown)
-        signal.signal(signal.SIGINT, self.handle_shutdown)
-
-    def handle_shutdown(self, signum, frame):
-        """处理进程终止信号"""
-        logger.info("接收到终止信号，准备关闭清理服务...")
-        self.running = False
-
-    def run(self):
-        """运行清理服务"""
-        logger.info("AdsPower清理服务启动")
-        
-        while self.running:
-            try:
-                # 直接调用 ProfilePool 的清理方法
-                self.pool.cleanup_resources()
-                
-            except Exception as e:
-                logger.error(f"清理服务运行出错: {e}")
-            
-            time.sleep(self.check_interval)
-
-        logger.info("AdsPower清理服务已停止")
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    logger.info("=== 开始多Spider场景测试 ===")
-    test_multi_spider_scenario()
-
 
 # 多行注释
 """
