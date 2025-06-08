@@ -2,6 +2,7 @@
 link/.gauth filter=git-crypt diff=git-crypt
 link/.ssh/** filter=git-crypt diff=git-crypt
 src/adspower/settings.py filter=git-crypt diff=git-crypt
+src/adspower/config.py filter=git-crypt diff=git-crypt
 
 
 # avoid accidentally encrypt files

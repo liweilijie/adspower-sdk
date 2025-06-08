@@ -2,7 +2,7 @@ import time
 import logging
 import redis
 from redis.exceptions import ConnectionError, TimeoutError
-from . import settings
+from .config import REDIS_CONFIG
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -17,14 +17,14 @@ class RedisPool:
         if self._pool is None:
             try:
                 self._pool = redis.BlockingConnectionPool(
-                    host=settings.REDIS_HOST,
-                    port=settings.REDIS_PORT,
-                    db=settings.REDIS_DB,
-                    password=settings.REDIS_PASSWORD,
-                    max_connections=settings.REDIS_CONNECTIONS,
+                    host=REDIS_CONFIG["HOST"],
+                    port=REDIS_CONFIG["PORT"],
+                    db=REDIS_CONFIG["DB"],
+                    password=REDIS_CONFIG["PASSWORD"],
+                    max_connections=REDIS_CONFIG["CONNECTIONS"],
                     # 关于 decode_responses 参数：如果您希望 Redis 返回的结果是字符串类型而不是字节串，可以将其设置为 True。这在处理字符串数据时非常方便，但如果您需要处理二进制数据（如使用 pickle 序列化的对象），建议保持为 False，以避免解码错误。
-                    decode_responses=settings.REDIS_DECODE_RESPONSES,
-                    health_check_interval=settings.REDIS_HEALTH_CHECK_INTERVAL,
+                    decode_responses=REDIS_CONFIG["DECODE_RESPONSES"],
+                    health_check_interval=REDIS_CONFIG["HEALTH_CHECK_INTERVAL"],
                     timeout=30,  # 等待连接可用的最大时间（秒）
                 )
             except Exception as e:
