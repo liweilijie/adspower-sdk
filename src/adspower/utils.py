@@ -2,7 +2,7 @@ import time
 import logging
 import redis
 from redis.exceptions import ConnectionError, TimeoutError
-from .config import REDIS_CONFIG
+from adspower.config import REDIS_CONFIG
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -15,6 +15,7 @@ class RedisPool:
         
     def get_pool(self):
         if self._pool is None:
+            logger.info(f"redis password: {REDIS_CONFIG['PASSWORD']}")
             try:
                 self._pool = redis.BlockingConnectionPool(
                     host=REDIS_CONFIG["HOST"],
@@ -85,3 +86,14 @@ def get_redis_client(max_retries: int = 3, retry_interval: int = 5):
         redis.ConnectionError: 如果在最大重试次数内都无法连接则抛出此异常
     """
     return pool.get_connection(max_retries, retry_interval)
+
+
+def decode_bytes(obj):
+    if isinstance(obj, dict):
+        return {decode_bytes(k): decode_bytes(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [decode_bytes(i) for i in obj]
+    elif isinstance(obj, bytes):
+        return obj.decode("utf-8")
+    else:
+        return obj

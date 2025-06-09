@@ -1,16 +1,12 @@
 import os
 import sys
 import signal
+import redis
 import time
 import logging
 import json
 from redis import Redis
 from typing import Set, Dict, List
-
-from .config import REDIS_KEYS, RESOURCE_MANAGEMENT, SERVICE_CONFIG
-from .utils import get_redis_client
-from .adspowermanager import ProfilePool
-from .adspowerapi import AdsPowerAPI
 
 # 获取当前文件的目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +16,10 @@ parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from adspower.settings import SERVICE_CHECK_INTERVAL
+from adspower.config import REDIS_KEYS, RESOURCE_MANAGEMENT, SERVICE_CONFIG
+from adspower.utils import get_redis_client
+from adspower.adspowermanager import ProfilePool
+from adspower.adspowerapi import AdsPowerAPI
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -64,13 +63,19 @@ class AdsPowerCleanerService:
     def _verify_redis_data(self) -> bool:
         """
         验证Redis中的数据是否完整和一致
+        
+        返回:
+            bool: 数据是否完整且一致
         """
         try:
-            # 检查必要的键是否存在
-            for key in REDIS_KEYS.values():
-                if not self.redis.exists(key):
-                    logger.warning(f"Redis键 {key} 不存在")
-                    return False
+            # 检查profile池和计数是否存在
+            if not self.redis.exists(REDIS_KEYS["PROFILE_POOL"]):
+                logger.warning(f"Redis键 {REDIS_KEYS['PROFILE_POOL']} 不存在")
+                return False
+                
+            if not self.redis.exists(REDIS_KEYS["PROFILE_COUNT"]):
+                logger.warning(f"Redis键 {REDIS_KEYS['PROFILE_COUNT']} 不存在")
+                return False
             
             # 检查计数是否一致
             profile_count = int(self.redis.get(REDIS_KEYS["PROFILE_COUNT"]) or 0)
@@ -79,7 +84,25 @@ class AdsPowerCleanerService:
             if profile_count != actual_count:
                 logger.warning(f"Profile计数不一致: 计数={profile_count}, 实际={actual_count}")
                 return False
-                
+            
+            # 检查数据完整性
+            all_profiles = self.pool.get_all_profiles()
+            for profile in all_profiles:
+                if not isinstance(profile, dict):
+                    logger.warning(f"Profile数据格式错误: {profile}")
+                    return False
+                    
+                # 检查必要字段
+                required_fields = {"user_id", "created_at", "last_used", "in_use", "browser_opened"}
+                missing_fields = required_fields - set(profile.keys())
+                if missing_fields:
+                    logger.warning(f"Profile {profile.get('user_id', 'unknown')} 缺少必要字段: {missing_fields}")
+                    return False
+            
+            # 心跳键不存在是正常的（当没有活跃进程时）
+            if not self.redis.exists(REDIS_KEYS["PROCESS_HEARTBEAT"]):
+                logger.debug(f"Redis键 {REDIS_KEYS['PROCESS_HEARTBEAT']} 不存在，这是正常的（当前没有活跃进程）")
+            
             return True
             
         except Exception as e:
@@ -159,8 +182,8 @@ class AdsPowerCleanerService:
             
         except Exception as e:
             logger.error(f"清理任务执行出错: {e}")
-            # 如果是Redis连接错误，尝试重新连接
-            if isinstance(e, (Redis.ConnectionError, Redis.TimeoutError)):
+            # 如果是Redis连接错误，尝试重新连接, TODO: 这个需要优化，不要每次都重新连接
+            if isinstance(e, (redis.exceptions.RedisConnectionError, redis.exceptions.RedisError)):
                 logger.warning("Redis连接失败，尝试重新连接...")
                 self.redis = get_redis_client()
 

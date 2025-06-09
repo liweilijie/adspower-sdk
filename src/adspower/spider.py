@@ -7,9 +7,20 @@ from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
+import os
+import sys
+import threading
 
-from .adspowermanager import AdspowerProfileLeaseManager
-from .adspowerapi import AdsPowerAPI
+# 获取当前文件的目录
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 将当前目录添加到 sys.path
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+
+from adspowermanager import AdspowerProfileLeaseManager
+from adspowerapi import AdsPowerAPI
 
 logger = logging.getLogger(__name__)
 
@@ -51,84 +62,62 @@ class AdsPowerMixin:
             spider_name: 爬虫名称,如果不传则使用self.name
             heartbeat_interval: 心跳间隔（秒）
         """
-        # 从kwargs中获取配置
-        heartbeat_interval = int(kwargs.get('heartbeat_interval', 30))
-        
-        # 初始化API
-        self.api = AdsPowerAPI()
-        
-        # 使用传入的redis客户端
-        self.redis = redis
-
-        logger.info(f"redis: {self.redis}")
-        
-        # 创建LeaseManager
+        api = AdsPowerAPI()
         self.lease_manager = AdspowerProfileLeaseManager(
-            api=self.api,
-            redis=self.redis,
+            api=api,
+            redis=redis,
             spider_name=spider_name or self.name,
-            heartbeat_interval=heartbeat_interval
+            **kwargs
         )
+        
+        # 启动心跳线程
+        self._start_heartbeat_thread()
 
-        logger.info(f"spider_name: {spider_name}")
-        
-        # 当前使用的profile信息
-        self._current_profile = None
+    def _start_heartbeat_thread(self):
+        """启动心跳线程"""
+        def update_heartbeat():
+            while True:
+                try:
+                    if hasattr(self, '_current_profile') and self._current_profile:
+                        process_id = str(os.getpid())
+                        self.lease_manager.update_process_heartbeat(process_id)
+                except Exception as e:
+                    logger.error(f"更新心跳失败: {e}")
+                time.sleep(30)  # 每30秒更新一次心跳
+
+        self._heartbeat_thread = threading.Thread(
+            target=update_heartbeat,
+            daemon=True
+        )
+        self._heartbeat_thread.start()
+
     @contextmanager
-    def get_browser(self, group_name: Optional[str] = None, 
-                   page_load_timeout: int = 60,
-                   implicit_wait: int = 10) -> Generator[webdriver.Chrome, None, None]:
-        """
-        获取一个浏览器实例的上下文管理器
-        
-        参数:
-            group_name: 指定使用的AdsPower分组名称，如果提供，会从指定分组获取profile
-            page_load_timeout: 页面加载超时时间（秒）
-            implicit_wait: 隐式等待时间（秒）
-            
-        用法:
-            with self.get_browser() as driver:
-                driver.get("https://example.com")
-                # ... 处理页面 ...
-        """
+    def get_browser(self, group_name: Optional[str] = None, **kwargs):
+        """获取浏览器实例的上下文管理器"""
         try:
-            # 如果指定了分组，先确保分组存在
-            if group_name:
-                group_id = self.api.get_or_create_group_by_name(group_name)
-                # 从指定分组获取profile
-                self.lease_manager.start(group_id)
-            else:
-                # 使用默认分组
-                self.lease_manager.start()
-            
-            # 启动浏览器
-            driver = self.lease_manager.start_driver()
-            if not driver:
-                raise RuntimeError("无法启动浏览器")
-                
-            # 配置浏览器
-            driver.set_page_load_timeout(page_load_timeout)
-            driver.implicitly_wait(implicit_wait)
-            
-            # 返回浏览器实例
-            yield driver
-            
+            # 获取浏览器实例
+            browser = self.lease_manager.get_browser(**kwargs)
+            if not browser:
+                raise RuntimeError("无法获取浏览器")
+
+            yield browser
+
         except Exception as e:
-            logger.error(f"浏览器管理出错: {e}")
-            # 检查是否是反爬相关的错误
-            if any(keyword in str(e).lower() for keyword in [
-                "blocked", "forbidden", "captcha", "verify", "challenge"
-            ]):
-                self.mark_profile_blocked()
+            logger.error(f"获取浏览器失败: {e}")
+            # 检查是否是反爬相关错误
+            if any(kw in str(e).lower() for kw in ["captcha", "verify", "blocked", "forbidden"]):
+                logger.error(f"mark profile blocked because {e}")
+                self.lease_manager.mark_profile_blocked()
             raise
-            
         finally:
-            # 确保资源被正确释放
-            self.lease_manager.stop()
-            
+            try:
+                self.lease_manager.release()
+            except Exception as e:
+                logger.error(f"释放资源时出错: {e}")
+
     def mark_profile_blocked(self):
-        """标记当前profile为被封状态"""
-        self.lease_manager.mark_current_profile_blocked()
+        """标记当前 profile 为被封状态"""
+        self.lease_manager.mark_profile_blocked()
         
     def wait_for_element(self, driver: webdriver.Chrome, by, value: str, 
                         timeout: int = 10, condition=EC.presence_of_element_located):
@@ -222,11 +211,13 @@ class AdsPowerMixin:
                         continue
                         
     def cleanup_adspower(self):
-        """
-        清理AdsPower资源
-        在Spider的close方法中调用
-        """
+        """清理资源"""
         try:
-            self.lease_manager.stop()
+            self.lease_manager.release()
         except Exception as e:
-            logger.error(f"关闭资源时出错: {e}") 
+            logger.error(f"清理资源时出错: {e}")
+
+    def ensure_connection(self):
+        """确保与AdsPower的连接"""
+        if not hasattr(self, 'lease_manager'):
+            raise RuntimeError("AdsPower功能未初始化") 
